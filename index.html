@@ -289,6 +289,47 @@
       </form>
     </div>
   </div>
+  <!-- ================= نافذة تعديل فاتورة موجودة ================= -->
+  <div id="edit-invoice-modal-backdrop" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.4);align-items:flex-start;justify-content:center;z-index:50;overflow:auto;">
+    <div class="card" style="width:420px;margin:20px auto;">
+      <h3>تعديل الفاتورة <span id="edit-invoice-number-label"></span></h3>
+      <form id="form-edit-invoice">
+        <label>نوع الحساب</label>
+        <select id="edit-invoice-account-type"></select>
+
+        <label style="margin-top:10px;">📅 تاريخ الزيارة / الفحص</label>
+        <input type="date" id="edit-invoice-visit-date" />
+
+        <h4 style="margin-top:14px;margin-bottom:6px;color:#166238;">بنود الفاتورة</h4>
+        <div style="display:flex;gap:6px;">
+          <input type="text" id="edit-item-name" placeholder="اسم الصنف" style="flex:2;" />
+          <input type="number" id="edit-item-qty" placeholder="الكمية" style="flex:1;" />
+          <input type="number" id="edit-item-price" placeholder="السعر" style="flex:1;" />
+          <button type="button" class="btn-small" id="btn-edit-add-item" style="flex-shrink:0;">➕</button>
+        </div>
+        <table class="data-table" style="margin-top:8px;">
+          <thead><tr><th>الصنف</th><th>الكمية</th><th>السعر</th><th>الإجمالي</th><th></th></tr></thead>
+          <tbody id="edit-items-draft-body"></tbody>
+        </table>
+        <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:8px;font-size:14px;">
+          <span>الإجمالي:</span><strong id="edit-draft-total">0.00 ج.م</strong>
+        </div>
+
+        <label style="margin-top:12px;">المبلغ المدفوع (ج.م)</label>
+        <input type="number" id="edit-invoice-paid" min="0" step="0.01" />
+
+        <label style="margin-top:10px;">ملاحظات (اختياري)</label>
+        <input type="text" id="edit-invoice-notes" />
+        <label style="margin-top:10px;">📅 تاريخ خاص بالملاحظة</label>
+        <input type="date" id="edit-invoice-notes-date" />
+
+        <div style="display:flex;gap:8px;margin-top:16px;">
+          <button type="submit" class="btn-primary" style="flex:1;">💾 حفظ التعديلات</button>
+          <button type="button" class="btn-small" id="btn-cancel-edit-invoice">إلغاء</button>
+        </div>
+      </form>
+    </div>
+  </div>
 
 </main>
 
@@ -465,6 +506,85 @@ const DB = (() => {
     return fs.collection("invoices").doc(invoiceNumber).delete();
   }
 
+  /**
+   * تعديل فاتورة موجودة (البنود / نوع الحساب / المدفوع / الملاحظات / التواريخ).
+   * بما إن كل فاتورة أو دفعة مبنية على رصيد اللي قبلها، أي تعديل في فاتورة قديمة
+   * لازم يعيد حساب "المتبقي" لكل العمليات اللي بعدها لنفس العميل تلقائياً،
+   * وبعدين يحدّث رصيد العميل الإجمالي النهائي. هنا بنعيد بناء السلسلة كاملة
+   * من الصفر لضمان صحة الأرقام 100% مهما كان التعديل.
+   */
+  async function updateInvoice(invoiceNumber, { accountType, items, paidAmount, notes, visitDate, notesDate }) {
+    const invoiceRef = fs.collection("invoices").doc(invoiceNumber);
+
+    const result = await fs.runTransaction(async (tx) => {
+      const invoiceSnap = await tx.get(invoiceRef);
+      if (!invoiceSnap.exists) throw new Error("الفاتورة غير موجودة");
+      const customerId = invoiceSnap.data().customerId;
+      const customerRef = fs.collection("customers").doc(customerId);
+
+      const customerSnap = await tx.get(customerRef);
+      if (!customerSnap.exists) throw new Error("العميل غير موجود");
+
+      const invoicesSnap = await tx.get(fs.collection("invoices").where("customerId", "==", customerId));
+      const paymentsSnap = await tx.get(fs.collection("payments").where("customerId", "==", customerId));
+
+      // بناء قائمة موحّدة بكل عمليات العميل، مع استبدال بيانات الفاتورة المعدَّلة
+      const newTotal = items.reduce((sum, it) => sum + it.qty * it.price, 0);
+      const paid = Number(paidAmount) || 0;
+
+      const chain = [];
+      invoicesSnap.forEach((doc) => {
+        if (doc.id === invoiceNumber) {
+          chain.push({
+            type: "invoice", ref: doc.ref, date: doc.data().date,
+            data: {
+              ...doc.data(), accountType, items, total: newTotal, paidAmount: paid,
+              notes: notes || "", visitDate: visitDate || null, notesDate: notesDate || null,
+            },
+          });
+        } else {
+          chain.push({ type: "invoice", ref: doc.ref, date: doc.data().date, data: doc.data() });
+        }
+      });
+      paymentsSnap.forEach((doc) => {
+        chain.push({ type: "payment", ref: doc.ref, date: doc.data().date, data: doc.data() });
+      });
+
+      chain.sort((a, b) => new Date(a.date) - new Date(b.date));
+
+      // إعادة حساب الرصيد خطوة بخطوة بداية من صفر
+      let running = 0;
+      for (const item of chain) {
+        const previousBalance = running;
+        if (item.type === "invoice") {
+          const total = item.data.total;
+          const paidAmt = item.data.paidAmount;
+          const remaining = previousBalance + total - paidAmt;
+          item.data = { ...item.data, previousBalance, remaining };
+          running = remaining;
+        } else {
+          const remaining = previousBalance - item.data.amount;
+          item.data = { ...item.data, previousBalance, remaining };
+          running = remaining;
+        }
+      }
+
+      // كتابة كل التغييرات دفعة واحدة
+      const invoiceNumbers = [];
+      const paymentNumbers = [];
+      for (const item of chain) {
+        tx.set(item.ref, item.data);
+        if (item.type === "invoice") invoiceNumbers.push(item.ref.id);
+        else paymentNumbers.push(item.ref.id);
+      }
+      tx.update(customerRef, { totalBalance: running });
+
+      return { newTotalBalance: running, invoiceNumbers, paymentNumbers };
+    });
+
+    return result;
+  }
+
   // ---------------------- الدفعات ----------------------
   function getPayments() { return STATE.payments; }
   function getPaymentById(paymentNumber) {
@@ -556,7 +676,7 @@ const DB = (() => {
 
   return {
     getCustomers, getCustomerById, addCustomer, deleteCustomer,
-    getInvoices, getInvoiceById, getInvoicesByCustomer, createInvoice, deleteInvoice,
+    getInvoices, getInvoiceById, getInvoicesByCustomer, createInvoice, deleteInvoice, updateInvoice,
     getPayments, getPaymentById, getPaymentsByCustomer, addPayment, deletePayment,
     getTransactions, onDataChange,
     login, logout, onAuthChange,
@@ -604,7 +724,18 @@ const PdfStore = (() => {
     });
   }
 
-  return { savePdf, getPdf };
+  // حذف نسخة PDF محفوظة (تُستخدم عند تغيّر بيانات فاتورة/دفعة بسبب تعديل ترتيبي سابق)
+  async function deletePdf(invoiceNumber) {
+    const db = await _openDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, "readwrite");
+      tx.objectStore(STORE_NAME).delete(invoiceNumber);
+      tx.oncomplete = () => resolve(true);
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  return { savePdf, getPdf, deletePdf };
 })();
 
 /* ---------------------- 4) توليد فاتورة PDF (لوجو + عنوان + ملاحظة أمان حيوي) ---------------------- */
@@ -931,6 +1062,8 @@ const WhatsApp = (() => {
 /* ---------------------- 6) منطق الواجهة ---------------------- */
 (() => {
   let invoiceItemsDraft = [];
+  let editInvoiceItemsDraft = [];
+  let editingInvoiceNumber = null;
   let currentTab = "customers";
   let currentStatementCustomerId = null;
 
@@ -1090,6 +1223,7 @@ const WhatsApp = (() => {
         <td>${fmt(tx.amount)}</td>
         <td>${fmt(tx.remaining)}</td>
         <td>
+          ${tx.type === "invoice" ? `<button class="btn-small" data-action="edit-invoice" data-num="${tx.number}">✏️ تعديل</button>` : ""}
           <button class="btn-small" data-action="download-doc" data-doctype="${tx.type}" data-num="${tx.number}">تنزيل PDF</button>
           <button class="btn-small" data-action="send-doc" data-doctype="${tx.type}" data-num="${tx.number}">واتساب</button>
         </td>
@@ -1138,6 +1272,7 @@ const WhatsApp = (() => {
                 <td>${fmt(tx.amount)}</td>
                 <td>${fmt(tx.remaining)}</td>
                 <td>
+                  ${tx.type === "invoice" ? `<button class="btn-small" data-action="edit-invoice" data-num="${tx.number}">✏️ تعديل</button>` : ""}
                   <button class="btn-small" data-action="download-doc" data-doctype="${tx.type}" data-num="${tx.number}">تنزيل PDF</button>
                   <button class="btn-small" data-action="send-doc" data-doctype="${tx.type}" data-num="${tx.number}">واتساب</button>
                 </td>
@@ -1208,6 +1343,105 @@ const WhatsApp = (() => {
     alert(`تم تسجيل الدفعة ${payment.paymentNumber} بنجاح.\nالرصيد المتبقي الآن: ${fmt(payment.remaining)}`);
   }
 
+  // ------------------- نافذة تعديل فاتورة موجودة -------------------
+  function openEditInvoiceModal(invoiceNumber) {
+    const invoice = DB.getInvoiceById(invoiceNumber);
+    if (!invoice) { alert("تعذّر العثور على الفاتورة"); return; }
+
+    editingInvoiceNumber = invoiceNumber;
+    editInvoiceItemsDraft = invoice.items.map((it) => ({ ...it }));
+
+    document.getElementById("edit-invoice-number-label").textContent = `(${invoiceNumber})`;
+
+    const accSelect = document.getElementById("edit-invoice-account-type");
+    accSelect.innerHTML = Object.values(ACCOUNT_TYPES)
+      .map((t) => `<option value="${t}">${t}</option>`).join("");
+    accSelect.value = invoice.accountType;
+
+    document.getElementById("edit-invoice-visit-date").value = invoice.visitDate || "";
+    document.getElementById("edit-invoice-paid").value = invoice.paidAmount;
+    document.getElementById("edit-invoice-notes").value = invoice.notes || "";
+    document.getElementById("edit-invoice-notes-date").value = invoice.notesDate || "";
+
+    renderEditItemsDraftTable();
+    document.getElementById("edit-invoice-modal-backdrop").style.display = "flex";
+  }
+
+  function closeEditInvoiceModal() {
+    document.getElementById("edit-invoice-modal-backdrop").style.display = "none";
+    editingInvoiceNumber = null;
+    editInvoiceItemsDraft = [];
+  }
+
+  function renderEditItemsDraftTable() {
+    const tbody = document.getElementById("edit-items-draft-body");
+    tbody.innerHTML = editInvoiceItemsDraft.map((it, idx) => `
+        <tr>
+          <td>${it.name}</td>
+          <td>${it.qty}</td>
+          <td>${it.price.toFixed(2)}</td>
+          <td>${(it.qty * it.price).toFixed(2)}</td>
+          <td><button class="btn-small btn-danger" data-action="remove-edit-item" data-idx="${idx}">حذف</button></td>
+        </tr>`).join("");
+    const total = editInvoiceItemsDraft.reduce((s, it) => s + it.qty * it.price, 0);
+    document.getElementById("edit-draft-total").textContent = fmt(total);
+  }
+
+  function handleEditAddItem() {
+    const name = document.getElementById("edit-item-name").value.trim();
+    const qty = parseFloat(document.getElementById("edit-item-qty").value);
+    const price = parseFloat(document.getElementById("edit-item-price").value);
+    if (!name || !qty || !price || qty <= 0 || price < 0) {
+      alert("الرجاء إدخال بيانات صحيحة للصنف"); return;
+    }
+    editInvoiceItemsDraft.push({ name, qty, price });
+    document.getElementById("edit-item-name").value = "";
+    document.getElementById("edit-item-qty").value = "";
+    document.getElementById("edit-item-price").value = "";
+    renderEditItemsDraftTable();
+  }
+
+  async function handleSubmitEditInvoice(e) {
+    e.preventDefault();
+    if (!editingInvoiceNumber) return;
+    if (editInvoiceItemsDraft.length === 0) {
+      alert("لازم يكون فيه صنف واحد على الأقل في الفاتورة"); return;
+    }
+
+    const accountType = document.getElementById("edit-invoice-account-type").value;
+    const visitDate = document.getElementById("edit-invoice-visit-date").value;
+    const paidAmount = parseFloat(document.getElementById("edit-invoice-paid").value) || 0;
+    const notes = document.getElementById("edit-invoice-notes").value.trim();
+    const notesDate = document.getElementById("edit-invoice-notes-date").value;
+
+    let result;
+    try {
+      result = await DB.updateInvoice(editingInvoiceNumber, {
+        accountType, items: editInvoiceItemsDraft, paidAmount, notes, visitDate, notesDate,
+      });
+    } catch (err) {
+      alert("تعذّر حفظ التعديل: " + err.message);
+      return;
+    }
+
+    // إبطال أي نسخ PDF قديمة محفوظة لكل العمليات المتأثرة، عشان تتولّد بالأرقام الجديدة
+    // في المرة الجاية اللي حد يفتح أو يبعت أي فاتورة/دفعة منهم
+    for (const num of result.invoiceNumbers) await PdfStore.deletePdf(num).catch(() => {});
+    for (const num of result.paymentNumbers) await PdfStore.deletePdf(num).catch(() => {});
+
+    closeEditInvoiceModal();
+
+    if (currentStatementCustomerId) showCustomerStatement(currentStatementCustomerId);
+
+    alert(
+      `تم حفظ تعديل الفاتورة بنجاح.\n` +
+      `الرصيد الإجمالي الحالي للعميل: ${fmt(result.newTotalBalance)}\n` +
+      (result.invoiceNumbers.length + result.paymentNumbers.length > 1
+        ? "تم تحديث المتبقي تلقائياً لكل العمليات اللاحقة لنفس العميل."
+        : "")
+    );
+  }
+
   function handleGlobalClick(e) {
     const btn = e.target.closest("button[data-action]");
     if (!btn) return;
@@ -1223,6 +1457,11 @@ const WhatsApp = (() => {
     } else if (action === "remove-item") {
       invoiceItemsDraft.splice(Number(btn.dataset.idx), 1);
       renderItemsDraftTable();
+    } else if (action === "edit-invoice") {
+      openEditInvoiceModal(btn.dataset.num);
+    } else if (action === "remove-edit-item") {
+      editInvoiceItemsDraft.splice(Number(btn.dataset.idx), 1);
+      renderEditItemsDraftTable();
     } else if (action === "download-doc") {
       handleDownloadDoc(btn.dataset.doctype, btn.dataset.num);
     } else if (action === "send-doc") {
@@ -1359,6 +1598,13 @@ const WhatsApp = (() => {
     document.getElementById("form-add-payment").addEventListener("submit", handleAddPayment);
     document.getElementById("payment-modal-backdrop").addEventListener("click", (e) => {
       if (e.target.id === "payment-modal-backdrop") closePaymentModal();
+    });
+
+    document.getElementById("btn-edit-add-item").addEventListener("click", handleEditAddItem);
+    document.getElementById("btn-cancel-edit-invoice").addEventListener("click", closeEditInvoiceModal);
+    document.getElementById("form-edit-invoice").addEventListener("submit", handleSubmitEditInvoice);
+    document.getElementById("edit-invoice-modal-backdrop").addEventListener("click", (e) => {
+      if (e.target.id === "edit-invoice-modal-backdrop") closeEditInvoiceModal();
     });
 
     document.getElementById("form-login").addEventListener("submit", handleLogin);
