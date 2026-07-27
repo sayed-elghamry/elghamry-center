@@ -267,7 +267,7 @@
 
   <!-- ================= نافذة تسجيل دفعة جديدة ================= -->
   <div id="payment-modal-backdrop" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.4);align-items:center;justify-content:center;z-index:50;">
-    <div class="card" style="width:360px;margin:0;">
+    <div class="card" style="width:92%;max-width:360px;margin:0;box-sizing:border-box;">
       <h3>تسجيل دفعة جديدة</h3>
       <form id="form-add-payment">
         <label>العميل</label>
@@ -291,7 +291,7 @@
   </div>
   <!-- ================= نافذة تعديل فاتورة موجودة ================= -->
   <div id="edit-invoice-modal-backdrop" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.4);align-items:flex-start;justify-content:center;z-index:50;overflow:auto;">
-    <div class="card" style="width:420px;margin:20px auto;">
+    <div class="card" style="width:92%;max-width:420px;margin:20px auto;box-sizing:border-box;">
       <h3>تعديل الفاتورة <span id="edit-invoice-number-label"></span></h3>
       <form id="form-edit-invoice">
         <label>نوع الحساب</label>
@@ -301,16 +301,26 @@
         <input type="date" id="edit-invoice-visit-date" />
 
         <h4 style="margin-top:14px;margin-bottom:6px;color:#166238;">بنود الفاتورة</h4>
-        <div style="display:flex;gap:6px;">
-          <input type="text" id="edit-item-name" placeholder="اسم الصنف" style="flex:2;" />
-          <input type="number" id="edit-item-qty" placeholder="الكمية" style="flex:1;" />
-          <input type="number" id="edit-item-price" placeholder="السعر" style="flex:1;" />
-          <button type="button" class="btn-small" id="btn-edit-add-item" style="flex-shrink:0;">➕</button>
+        <div class="form-row" style="margin-bottom:6px;">
+          <div style="flex:2;min-width:120px;">
+            <input type="text" id="edit-item-name" placeholder="اسم الصنف" style="width:100%;box-sizing:border-box;" />
+          </div>
+          <div style="flex:1;min-width:80px;">
+            <input type="number" id="edit-item-qty" placeholder="الكمية" style="width:100%;box-sizing:border-box;" />
+          </div>
+          <div style="flex:1;min-width:80px;">
+            <input type="number" id="edit-item-price" placeholder="السعر" style="width:100%;box-sizing:border-box;" />
+          </div>
+          <div style="flex:0 0 auto;">
+            <button type="button" class="btn-small" id="btn-edit-add-item">➕ إضافة</button>
+          </div>
         </div>
-        <table class="data-table" style="margin-top:8px;">
+        <div style="overflow-x:auto;">
+        <table class="data-table" style="margin-top:8px;min-width:420px;">
           <thead><tr><th>الصنف</th><th>الكمية</th><th>السعر</th><th>الإجمالي</th><th></th></tr></thead>
           <tbody id="edit-items-draft-body"></tbody>
         </table>
+        </div>
         <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:8px;font-size:14px;">
           <span>الإجمالي:</span><strong id="edit-draft-total">0.00 ج.م</strong>
         </div>
@@ -502,8 +512,65 @@ const DB = (() => {
     return result;
   }
 
-  function deleteInvoice(invoiceNumber) {
-    return fs.collection("invoices").doc(invoiceNumber).delete();
+  /**
+   * حذف فاتورة نهائياً، مع إعادة حساب "المتبقي" تلقائياً لكل ما بعدها من فواتير
+   * ودفعات لنفس العميل (بنفس منطق التعديل)، وتحديث رصيد العميل الإجمالي.
+   */
+  async function deleteInvoice(invoiceNumber) {
+    const invoiceRef = fs.collection("invoices").doc(invoiceNumber);
+
+    const result = await fs.runTransaction(async (tx) => {
+      const invoiceSnap = await tx.get(invoiceRef);
+      if (!invoiceSnap.exists) throw new Error("الفاتورة غير موجودة أصلاً");
+      const customerId = invoiceSnap.data().customerId;
+      const customerRef = fs.collection("customers").doc(customerId);
+
+      const customerSnap = await tx.get(customerRef);
+      if (!customerSnap.exists) throw new Error("العميل غير موجود");
+
+      const invoicesSnap = await tx.get(fs.collection("invoices").where("customerId", "==", customerId));
+      const paymentsSnap = await tx.get(fs.collection("payments").where("customerId", "==", customerId));
+
+      const chain = [];
+      invoicesSnap.forEach((doc) => {
+        if (doc.id !== invoiceNumber) {
+          chain.push({ type: "invoice", ref: doc.ref, date: doc.data().date, data: doc.data() });
+        }
+      });
+      paymentsSnap.forEach((doc) => {
+        chain.push({ type: "payment", ref: doc.ref, date: doc.data().date, data: doc.data() });
+      });
+
+      chain.sort((a, b) => new Date(a.date) - new Date(b.date));
+
+      let running = 0;
+      for (const item of chain) {
+        const previousBalance = running;
+        if (item.type === "invoice") {
+          const remaining = previousBalance + item.data.total - item.data.paidAmount;
+          item.data = { ...item.data, previousBalance, remaining };
+          running = remaining;
+        } else {
+          const remaining = previousBalance - item.data.amount;
+          item.data = { ...item.data, previousBalance, remaining };
+          running = remaining;
+        }
+      }
+
+      const invoiceNumbers = [];
+      const paymentNumbers = [];
+      for (const item of chain) {
+        tx.set(item.ref, item.data);
+        if (item.type === "invoice") invoiceNumbers.push(item.ref.id);
+        else paymentNumbers.push(item.ref.id);
+      }
+      tx.delete(invoiceRef);
+      tx.update(customerRef, { totalBalance: running });
+
+      return { newTotalBalance: running, invoiceNumbers, paymentNumbers };
+    });
+
+    return result;
   }
 
   /**
@@ -1224,6 +1291,7 @@ const WhatsApp = (() => {
         <td>${fmt(tx.remaining)}</td>
         <td>
           ${tx.type === "invoice" ? `<button class="btn-small" data-action="edit-invoice" data-num="${tx.number}">✏️ تعديل</button>` : ""}
+          ${tx.type === "invoice" ? `<button class="btn-small btn-danger" data-action="delete-invoice" data-num="${tx.number}">🗑️ حذف</button>` : ""}
           <button class="btn-small" data-action="download-doc" data-doctype="${tx.type}" data-num="${tx.number}">تنزيل PDF</button>
           <button class="btn-small" data-action="send-doc" data-doctype="${tx.type}" data-num="${tx.number}">واتساب</button>
         </td>
@@ -1273,6 +1341,7 @@ const WhatsApp = (() => {
                 <td>${fmt(tx.remaining)}</td>
                 <td>
                   ${tx.type === "invoice" ? `<button class="btn-small" data-action="edit-invoice" data-num="${tx.number}">✏️ تعديل</button>` : ""}
+                  ${tx.type === "invoice" ? `<button class="btn-small btn-danger" data-action="delete-invoice" data-num="${tx.number}">🗑️ حذف</button>` : ""}
                   <button class="btn-small" data-action="download-doc" data-doctype="${tx.type}" data-num="${tx.number}">تنزيل PDF</button>
                   <button class="btn-small" data-action="send-doc" data-doctype="${tx.type}" data-num="${tx.number}">واتساب</button>
                 </td>
@@ -1442,6 +1511,30 @@ const WhatsApp = (() => {
     );
   }
 
+  async function handleDeleteInvoice(invoiceNumber) {
+    const invoice = DB.getInvoiceById(invoiceNumber);
+    const label = invoice ? `${invoiceNumber} (${invoice.customerName})` : invoiceNumber;
+    if (!confirm(`هل أنت متأكد من حذف الفاتورة ${label} نهائياً؟\nسيتم إعادة حساب المتبقي تلقائياً لكل العمليات اللاحقة لنفس العميل.`)) {
+      return;
+    }
+
+    let result;
+    try {
+      result = await DB.deleteInvoice(invoiceNumber);
+    } catch (err) {
+      alert("تعذّر حذف الفاتورة: " + err.message);
+      return;
+    }
+
+    await PdfStore.deletePdf(invoiceNumber).catch(() => {});
+    for (const num of result.invoiceNumbers) await PdfStore.deletePdf(num).catch(() => {});
+    for (const num of result.paymentNumbers) await PdfStore.deletePdf(num).catch(() => {});
+
+    if (currentStatementCustomerId) showCustomerStatement(currentStatementCustomerId);
+
+    alert(`تم حذف الفاتورة ${invoiceNumber}.\nالرصيد الإجمالي الحالي للعميل: ${fmt(result.newTotalBalance)}`);
+  }
+
   function handleGlobalClick(e) {
     const btn = e.target.closest("button[data-action]");
     if (!btn) return;
@@ -1459,6 +1552,8 @@ const WhatsApp = (() => {
       renderItemsDraftTable();
     } else if (action === "edit-invoice") {
       openEditInvoiceModal(btn.dataset.num);
+    } else if (action === "delete-invoice") {
+      handleDeleteInvoice(btn.dataset.num);
     } else if (action === "remove-edit-item") {
       editInvoiceItemsDraft.splice(Number(btn.dataset.idx), 1);
       renderEditItemsDraftTable();
