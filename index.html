@@ -519,26 +519,37 @@ const DB = (() => {
   async function deleteInvoice(invoiceNumber) {
     const invoiceRef = fs.collection("invoices").doc(invoiceNumber);
 
+    // نجيب رقم العميل وقائمة كل فواتيره ودفعاته أولاً بقراءة عادية (خارج الترانزاكشن)،
+    // لأن Firestore (نسخة المتصفح) بتسمح بقراءة مستند واحد بمرجعه فقط جوا الترانزاكشن،
+    // ومش بتسمح بقراءة نتيجة استعلام (where) كاملة جوا الترانزاكشن.
+    const invoiceSnapOuter = await invoiceRef.get();
+    if (!invoiceSnapOuter.exists) throw new Error("الفاتورة غير موجودة أصلاً");
+    const customerId = invoiceSnapOuter.data().customerId;
+    const customerRef = fs.collection("customers").doc(customerId);
+
+    const invoicesQuery = await fs.collection("invoices").where("customerId", "==", customerId).get();
+    const paymentsQuery = await fs.collection("payments").where("customerId", "==", customerId).get();
+    const invoiceRefs = invoicesQuery.docs.map((d) => d.ref);
+    const paymentRefs = paymentsQuery.docs.map((d) => d.ref);
+
     const result = await fs.runTransaction(async (tx) => {
       const invoiceSnap = await tx.get(invoiceRef);
       if (!invoiceSnap.exists) throw new Error("الفاتورة غير موجودة أصلاً");
-      const customerId = invoiceSnap.data().customerId;
-      const customerRef = fs.collection("customers").doc(customerId);
 
       const customerSnap = await tx.get(customerRef);
       if (!customerSnap.exists) throw new Error("العميل غير موجود");
 
-      const invoicesSnap = await tx.get(fs.collection("invoices").where("customerId", "==", customerId));
-      const paymentsSnap = await tx.get(fs.collection("payments").where("customerId", "==", customerId));
+      const invoiceSnaps = await Promise.all(invoiceRefs.map((r) => tx.get(r)));
+      const paymentSnaps = await Promise.all(paymentRefs.map((r) => tx.get(r)));
 
       const chain = [];
-      invoicesSnap.forEach((doc) => {
-        if (doc.id !== invoiceNumber) {
+      invoiceSnaps.forEach((doc) => {
+        if (doc.exists && doc.id !== invoiceNumber) {
           chain.push({ type: "invoice", ref: doc.ref, date: doc.data().date, data: doc.data() });
         }
       });
-      paymentsSnap.forEach((doc) => {
-        chain.push({ type: "payment", ref: doc.ref, date: doc.data().date, data: doc.data() });
+      paymentSnaps.forEach((doc) => {
+        if (doc.exists) chain.push({ type: "payment", ref: doc.ref, date: doc.data().date, data: doc.data() });
       });
 
       chain.sort((a, b) => new Date(a.date) - new Date(b.date));
@@ -583,24 +594,36 @@ const DB = (() => {
   async function updateInvoice(invoiceNumber, { accountType, items, paidAmount, notes, visitDate, notesDate }) {
     const invoiceRef = fs.collection("invoices").doc(invoiceNumber);
 
+    // نجيب رقم العميل وقائمة كل فواتيره ودفعاته أولاً بقراءة عادية (خارج الترانزاكشن)،
+    // لأن Firestore (نسخة المتصفح) بتسمح بقراءة مستند واحد بمرجعه فقط جوا الترانزاكشن،
+    // ومش بتسمح بقراءة نتيجة استعلام (where) كاملة جوا الترانزاكشن.
+    const invoiceSnapOuter = await invoiceRef.get();
+    if (!invoiceSnapOuter.exists) throw new Error("الفاتورة غير موجودة");
+    const customerId = invoiceSnapOuter.data().customerId;
+    const customerRef = fs.collection("customers").doc(customerId);
+
+    const invoicesQuery = await fs.collection("invoices").where("customerId", "==", customerId).get();
+    const paymentsQuery = await fs.collection("payments").where("customerId", "==", customerId).get();
+    const invoiceRefs = invoicesQuery.docs.map((d) => d.ref);
+    const paymentRefs = paymentsQuery.docs.map((d) => d.ref);
+
     const result = await fs.runTransaction(async (tx) => {
       const invoiceSnap = await tx.get(invoiceRef);
       if (!invoiceSnap.exists) throw new Error("الفاتورة غير موجودة");
-      const customerId = invoiceSnap.data().customerId;
-      const customerRef = fs.collection("customers").doc(customerId);
 
       const customerSnap = await tx.get(customerRef);
       if (!customerSnap.exists) throw new Error("العميل غير موجود");
 
-      const invoicesSnap = await tx.get(fs.collection("invoices").where("customerId", "==", customerId));
-      const paymentsSnap = await tx.get(fs.collection("payments").where("customerId", "==", customerId));
+      const invoiceSnaps = await Promise.all(invoiceRefs.map((r) => tx.get(r)));
+      const paymentSnaps = await Promise.all(paymentRefs.map((r) => tx.get(r)));
 
       // بناء قائمة موحّدة بكل عمليات العميل، مع استبدال بيانات الفاتورة المعدَّلة
       const newTotal = items.reduce((sum, it) => sum + it.qty * it.price, 0);
       const paid = Number(paidAmount) || 0;
 
       const chain = [];
-      invoicesSnap.forEach((doc) => {
+      invoiceSnaps.forEach((doc) => {
+        if (!doc.exists) return;
         if (doc.id === invoiceNumber) {
           chain.push({
             type: "invoice", ref: doc.ref, date: doc.data().date,
@@ -613,8 +636,8 @@ const DB = (() => {
           chain.push({ type: "invoice", ref: doc.ref, date: doc.data().date, data: doc.data() });
         }
       });
-      paymentsSnap.forEach((doc) => {
-        chain.push({ type: "payment", ref: doc.ref, date: doc.data().date, data: doc.data() });
+      paymentSnaps.forEach((doc) => {
+        if (doc.exists) chain.push({ type: "payment", ref: doc.ref, date: doc.data().date, data: doc.data() });
       });
 
       chain.sort((a, b) => new Date(a.date) - new Date(b.date));
