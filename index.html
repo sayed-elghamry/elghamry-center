@@ -268,7 +268,10 @@
   <!-- ================= نافذة تسجيل دفعة جديدة ================= -->
   <div id="payment-modal-backdrop" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.4);align-items:center;justify-content:center;z-index:50;">
     <div class="card" style="width:92%;max-width:360px;margin:0;box-sizing:border-box;">
-      <h3>تسجيل دفعة جديدة</h3>
+      <div style="display:flex;justify-content:space-between;align-items:center;">
+        <h3 style="margin:0;">تسجيل دفعة جديدة</h3>
+        <button type="button" id="btn-close-payment-x" style="background:none;border:none;font-size:22px;line-height:1;cursor:pointer;color:#5b6b62;">✕</button>
+      </div>
       <form id="form-add-payment">
         <label>العميل</label>
         <select id="payment-customer" required></select>
@@ -292,7 +295,10 @@
   <!-- ================= نافذة تعديل فاتورة موجودة ================= -->
   <div id="edit-invoice-modal-backdrop" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.4);align-items:flex-start;justify-content:center;z-index:50;overflow:auto;">
     <div class="card" style="width:92%;max-width:420px;margin:20px auto;box-sizing:border-box;">
-      <h3>تعديل الفاتورة <span id="edit-invoice-number-label"></span></h3>
+      <div style="display:flex;justify-content:space-between;align-items:center;">
+        <h3 style="margin:0;">تعديل الفاتورة <span id="edit-invoice-number-label"></span></h3>
+        <button type="button" id="btn-close-edit-invoice-x" style="background:none;border:none;font-size:22px;line-height:1;cursor:pointer;color:#5b6b62;">✕</button>
+      </div>
       <form id="form-edit-invoice">
         <label>نوع الحساب</label>
         <select id="edit-invoice-account-type"></select>
@@ -925,8 +931,8 @@ const InvoicePDF = (() => {
     document.body.appendChild(element);
 
     try {
-      const canvas = await html2canvas(element, { scale: 2, useCORS: true });
-      const imgData = canvas.toDataURL("image/png");
+      const canvas = await html2canvas(element, { scale: 1.5, useCORS: true });
+      const imgData = canvas.toDataURL("image/jpeg", 0.85);
 
       const { jsPDF } = window.jspdf;
       const pdf = new jsPDF({ orientation: "portrait", unit: "mm", format: "a4" });
@@ -935,7 +941,7 @@ const InvoicePDF = (() => {
       const imgWidth = pageWidth - 20;
       const imgHeight = (canvas.height * imgWidth) / canvas.width;
 
-      pdf.addImage(imgData, "PNG", 10, 10, imgWidth, imgHeight);
+      pdf.addImage(imgData, "JPEG", 10, 10, imgWidth, imgHeight);
 
       const pdfBlob = pdf.output("blob");
       await PdfStore.savePdf(invoice.invoiceNumber, pdfBlob); // قاعدة رقم 4
@@ -1030,8 +1036,8 @@ const ReceiptPDF = (() => {
     document.body.appendChild(element);
 
     try {
-      const canvas = await html2canvas(element, { scale: 2, useCORS: true });
-      const imgData = canvas.toDataURL("image/png");
+      const canvas = await html2canvas(element, { scale: 1.5, useCORS: true });
+      const imgData = canvas.toDataURL("image/jpeg", 0.85);
 
       const { jsPDF } = window.jspdf;
       const pdf = new jsPDF({ orientation: "portrait", unit: "mm", format: "a4" });
@@ -1040,7 +1046,7 @@ const ReceiptPDF = (() => {
       const imgWidth = pageWidth - 20;
       const imgHeight = (canvas.height * imgWidth) / canvas.width;
 
-      pdf.addImage(imgData, "PNG", 10, 10, imgWidth, imgHeight);
+      pdf.addImage(imgData, "JPEG", 10, 10, imgWidth, imgHeight);
 
       const pdfBlob = pdf.output("blob");
       await PdfStore.savePdf(payment.paymentNumber, pdfBlob); // نفس مبدأ حفظ نسخة تلقائياً
@@ -1117,6 +1123,8 @@ const WhatsApp = (() => {
       const file = new File([pdfBlob], fileName, { type: "application/pdf" });
       if (navigator.canShare({ files: [file] })) {
         try {
+          // قائمة المشاركة الأصلية للجهاز - بتفتح مهما كان فيه رقم هاتف مسجّل أو لأ،
+          // لأن المستخدم بيختار الوجهة بنفسه (واتساب، تليجرام، إيميل، أو حتى يبعتها لنفسه)
           await navigator.share({ files: [file], text: message, title: fileName });
           return { method: "share" };
         } catch (err) {
@@ -1125,7 +1133,7 @@ const WhatsApp = (() => {
       }
     }
 
-    // الطريقة البديلة: تنزيل الملف يدوياً + فتح واتساب برسالة نصية
+    // الطريقة البديلة: تنزيل الملف دائماً، وفتح واتساب برسالة نصية بس لو فيه رقم مسجّل
     if (pdfBlob) {
       const url = URL.createObjectURL(pdfBlob);
       const a = document.createElement("a");
@@ -1134,6 +1142,10 @@ const WhatsApp = (() => {
       a.click();
       URL.revokeObjectURL(url);
     }
+
+    const phone = _normalizePhone(customerPhone);
+    if (!phone) return { method: "downloaded-only" };
+
     sendTextOnly(customerPhone, message);
     return { method: "fallback" };
   }
@@ -1598,11 +1610,6 @@ const WhatsApp = (() => {
     const doc = isInvoice ? DB.getInvoiceById(number) : DB.getPaymentById(number);
     const customer = DB.getCustomerById(doc.customerId);
 
-    if (!customer.phone) {
-      alert("لا يوجد رقم هاتف مسجّل لهذا العميل.");
-      return;
-    }
-
     let pdfBlob = await PdfStore.getPdf(number);
     if (!pdfBlob) {
       try {
@@ -1623,6 +1630,11 @@ const WhatsApp = (() => {
         alert(
           "متصفحك/جهازك لا يدعم إرفاق الملف تلقائياً في واتساب (هذه الميزة متاحة على متصفحات الموبايل الحديثة فقط).\n" +
           "تم تنزيل ملف PDF وفتح واتساب برسالة الملخص - أرفق الملف الذي تم تنزيله يدوياً في المحادثة."
+        );
+      } else if (result.method === "downloaded-only") {
+        alert(
+          "لا يوجد رقم هاتف مسجّل لهذا العميل، فتم تنزيل ملف PDF فقط على جهازك.\n" +
+          "تقدر تفتحه من التنزيلات وتبعته يدوياً لأي حد تحب."
         );
       }
     } catch (err) {
@@ -1720,6 +1732,8 @@ const WhatsApp = (() => {
 
     document.getElementById("btn-edit-add-item").addEventListener("click", handleEditAddItem);
     document.getElementById("btn-cancel-edit-invoice").addEventListener("click", closeEditInvoiceModal);
+    document.getElementById("btn-close-edit-invoice-x").addEventListener("click", closeEditInvoiceModal);
+    document.getElementById("btn-close-payment-x").addEventListener("click", closePaymentModal);
     document.getElementById("form-edit-invoice").addEventListener("submit", handleSubmitEditInvoice);
     document.getElementById("edit-invoice-modal-backdrop").addEventListener("click", (e) => {
       if (e.target.id === "edit-invoice-modal-backdrop") closeEditInvoiceModal();
