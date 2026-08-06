@@ -1211,6 +1211,7 @@ const WhatsApp = (() => {
         <td class="${balanceClass}">${fmt(c.totalBalance)}</td>
         <td>
           <button class="btn-small" data-action="statement" data-id="${c.id}">كشف حساب</button>
+          <button class="btn-small btn-primary" data-action="quick-payment" data-id="${c.id}" style="padding:6px 10px;">💰 سداد</button>
           <button class="btn-small btn-danger" data-action="delete-customer" data-id="${c.id}">حذف</button>
         </td>`;
       tbody.appendChild(tr);
@@ -1582,6 +1583,8 @@ const WhatsApp = (() => {
       }
     } else if (action === "statement") {
       showCustomerStatement(btn.dataset.id);
+    } else if (action === "quick-payment") {
+      openPaymentModal(btn.dataset.id);
     } else if (action === "remove-item") {
       invoiceItemsDraft.splice(Number(btn.dataset.idx), 1);
       renderItemsDraftTable();
